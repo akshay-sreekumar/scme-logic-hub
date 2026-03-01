@@ -48,9 +48,17 @@ DATA_WINDOW_SECONDS = 30 # A user is considered "active" in a zone if seen withi
 LOOP_INTERVAL = 10 # Run the loop every 10 seconds
 DENSITY_ALERT_THRESHOLD = 85 # Trigger alert if density > 85%
 
+# Predictive Settings
+HISTORY_SIZE = 12 # Keep last 12 loops (12 * 10s = 2 minutes of history)
+PREDICT_AHEAD_MINUTES = 5 # How many minutes into the future to predict
+PREDICT_AHEAD_TICKS = (PREDICT_AHEAD_MINUTES * 60) / LOOP_INTERVAL
+
 def run_logic_hub():
     print("🧠 Smart Crowd Management Logic Hub Started...")
     print(f"Monitoring {len(ZONES)} zones every {LOOP_INTERVAL} seconds.\n")
+    
+    # State Memory for Prediction
+    zone_history = {zone_id: [] for zone_id in ZONES.keys()}
     
     while True:
         try:
@@ -102,8 +110,35 @@ def run_logic_hub():
                 density_percentage = int((total_people / bounds['max_capacity']) * 100)
                 density_percentage = min(100, density_percentage) # Cap at 100%
                 
+                # Add to history for prediction
+                zone_history[zone_id].append(density_percentage)
+                if len(zone_history[zone_id]) > HISTORY_SIZE:
+                    zone_history[zone_id].pop(0) # Keep queue size capped
+                
+                # --- Linear Regression Math ---
+                predicted_density = density_percentage
+                if len(zone_history[zone_id]) >= 3: # Need at least 3 points to draw a line
+                    y = zone_history[zone_id]
+                    x = list(range(len(y)))
+                    
+                    # Calculate slope (m) = sum((x - mean_x) * (y - mean_y)) / sum((x - mean_x)^2)
+                    mean_x = sum(x) / len(x)
+                    mean_y = sum(y) / len(y)
+                    
+                    numerator = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+                    denominator = sum((xi - mean_x) ** 2 for xi in x)
+                    
+                    slope = numerator / denominator if denominator != 0 else 0
+                    
+                    # Predict future
+                    predicted_density = min(100, int(density_percentage + (slope * PREDICT_AHEAD_TICKS)))
+                    predicted_density = max(0, predicted_density) # Can't be negative
+                
+                # Print Status
                 status_icon = "🟢" if density_percentage < 50 else ("🟠" if density_percentage < 85 else "🔴")
-                print(f"{status_icon} [{bounds['name']}] GPS: {gps_count} | Cam: {cam_count} => Total: {total_people} ({density_percentage}% capacity)")
+                trend_icon = "↗️" if predicted_density > density_percentage + 5 else ("↘️" if predicted_density < density_percentage - 5 else "➡️")
+                
+                print(f"{status_icon} [{bounds['name']}] GPS: {gps_count} | Cam: {cam_count} => Density: {density_percentage}% {trend_icon} (Pred in {PREDICT_AHEAD_MINUTES}m: {predicted_density}%)")
                 
                 # Upsert into `density` table
                 supabase.table("density").upsert({
@@ -116,7 +151,6 @@ def run_logic_hub():
                 # 5. Alert Trigger Engine
                 if density_percentage > DENSITY_ALERT_THRESHOLD:
                     print(f"   ⚠️ HIGH DENSITY ALERT Triggered for {bounds['name']}!")
-                    
                     # Insert into alerts table
                     supabase.table("alerts").insert({
                         "type": "CROWD_SURGE",
@@ -125,7 +159,17 @@ def run_logic_hub():
                         "instruction": f"Disperse crowd in {bounds['name']}. Reached {density_percentage}% capacity.",
                         "latitude": bounds['center_lat'],
                         "longitude": bounds['center_lng']
-                        # "camera_id": null (since it's a zone-wide structural alert, not from a specific camera)
+                    }).execute()
+                elif predicted_density > DENSITY_ALERT_THRESHOLD:
+                    print(f"   🔮 PREDICTIVE WARNING: {bounds['name']} is trending towards {predicted_density}% capacity in {PREDICT_AHEAD_MINUTES} minutes!")
+                    # Insert early warning alert
+                    supabase.table("alerts").insert({
+                        "type": "PREDICTIVE_WARNING",
+                        "priority": "MEDIUM",
+                        "confidence": 0.8, # Prediction is less confident than live data
+                        "instruction": f"Prepare for surge at {bounds['name']}. Projected to hit {predicted_density}% capacity in {PREDICT_AHEAD_MINUTES} mins.",
+                        "latitude": bounds['center_lat'],
+                        "longitude": bounds['center_lng']
                     }).execute()
 
         except Exception as e:
